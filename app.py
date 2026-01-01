@@ -3,9 +3,10 @@ import torch
 import torch.nn as nn
 from PIL import Image
 import numpy as np
+import cv2
 
 
-# --------- MODEL ARCHITECTURE ----------
+# -------- MODEL ----------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -41,7 +42,7 @@ model = load_model()
 
 st.title("EF Classifier (ECG → EF Group)")
 
-uploaded = st.file_uploader("Upload ECG image", type=["jpg", "jpeg", "png"])
+uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
 labels = {
     0: "EF < 35%",
@@ -57,25 +58,38 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
+# ----- quick ECG detector (rule-based) -----
+def looks_like_ecg(img: Image.Image) -> bool:
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape
+
+    # ECG is usually wider than tall
+    if w < h * 1.2:
+        return False
+
+    # detect amount of edges (ECG has many fine edges)
+    edges = cv2.Canny(arr, 40, 120)
+    edge_ratio = edges.mean()
+
+    return edge_ratio > 0.03
+
+
 if uploaded:
     img = Image.open(uploaded)
-    st.image(img, caption="Uploaded ECG", width=350)
+    st.image(img, caption="Uploaded Image", width=350)
 
-    x = preprocess(img)
-
-    with torch.no_grad():
-        y = model(x)
-
-        # probabilities
-        probs = torch.softmax(y, dim=1)[0]
-        conf, pred = torch.max(probs, dim=0)
-        conf = float(conf)
-
-    # -------- detect NON-ECG images --------
-    if conf < 0.45:
-        st.error("❌ این تصویر نوار قلب نیست یا کیفیتش مناسب نیست.")
-        st.caption(f"(confidence = {conf:.2f})")
+    # -------- 1) check if ECG ----------
+    if not looks_like_ecg(img):
+        st.error("❌ این تصویر شبیه نوار قلب نیست.")
     else:
+        # -------- 2) EF prediction ----------
+        x = preprocess(img)
+
+        with torch.no_grad():
+            y = model(x)
+            probs = torch.softmax(y, dim=1)[0]
+            conf, pred = torch.max(probs, dim=0)
+
         st.subheader("Result:")
-        st.success(f"{labels[int(pred)]}")
-        st.caption(f"confidence = {conf:.2f}")
+        st.success(labels[int(pred)])
+        st.caption(f"confidence = {float(conf):.2f}")
