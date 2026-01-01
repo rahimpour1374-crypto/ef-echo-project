@@ -1,4 +1,4 @@
-# VERSION: ECG-DETECTOR-WEIGHTED
+# VERSION: CALIBRATED + STRONGER ECG FILTER
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -6,7 +6,7 @@ from PIL import Image
 import numpy as np
 
 
-# -------- MODEL (EF classifier) ----------
+# -------- MODEL ----------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -58,50 +58,53 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
-# -------- ECG detector (weighted heuristic — بهتر و پایدارتر) --------
+# ----- stronger ECG detector -----
 def looks_like_ecg(img: Image.Image) -> bool:
     gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
     h, w = gray.shape
 
     score = 0.0
 
-    # افقی بودن تصویر (ECG معمولاً افقی‌تر است)
-    if w > h * 1.15:
-        score += 0.4
+    # 1) افقی بودن
+    if w > h * 1.25:
+        score += 0.5
 
-    # کنتراست (نه خیلی صاف، نه خیلی پرنویز)
-    score += min(gray.std() * 2, 0.4)
-
-    # لبه‌ها (وجود موج‌ها و خطوط شبکه)
+    # 2) خطوط (لبه‌ها)
     gx = gray[:, 1:] - gray[:, :-1]
     gy = gray[1:, :] - gray[:-1, :]
     edges = np.abs(gx).mean() + np.abs(gy).mean()
-    score += min(edges * 2, 0.4)
+    score += min(edges * 2, 0.5)
 
-    # تغییرپذیری افقی (وجود لید/موج تکراری)
-    row_var = gray.var(axis=1).mean()
-    score += min(row_var * 20, 0.4)
+    # 3) تکرار افقی لیدها
+    row_var = gray.var(axis=1)
+    periodic = (row_var > row_var.mean()).mean()
+    score += min(periodic * 0.6, 0.6)
 
-    # تصمیم نهایی — اگر مجموع ویژگی‌ها به اندازه کافی شبیه بود
-    return score >= 0.6
+    return score >= 0.9
 
 
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Uploaded Image", width=350)
 
-    # مرحله ۱: تشخیص ECG
+    # ECG detection
     if not looks_like_ecg(img):
         st.error("❌ این تصویر شبیه نوار قلب نیست.")
     else:
-        # مرحله ۲: پیش‌بینی EF
         x = preprocess(img)
 
         with torch.no_grad():
             y = model(x)
             probs = torch.softmax(y, dim=1)[0]
             conf, pred = torch.max(probs, dim=0)
+            conf = float(conf)
+            pred = int(pred)
+
+        # ---- CALIBRATION RULE ----
+        # اگر مدل مطمئن نباشه → پیش‌فرض بذار 35–49
+        if conf < 0.55:
+            pred = 1
 
         st.subheader("Result:")
-        st.success(labels[int(pred)])
-        st.caption(f"confidence = {float(conf):.2f}")
+        st.success(labels[pred])
+        st.caption(f"confidence (raw model) = {conf:.2f}")
