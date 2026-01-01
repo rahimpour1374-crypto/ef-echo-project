@@ -1,4 +1,4 @@
-# VERSION: ECG-BALANCED
+# VERSION: ECG-DETECTOR-WEIGHTED
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -6,7 +6,7 @@ from PIL import Image
 import numpy as np
 
 
-# -------- MODEL ----------
+# -------- MODEL (EF classifier) ----------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -58,45 +58,43 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
-# ---- ECG detector (balanced — نه خیلی سفت، نه خیلی شُل) ----
+# -------- ECG detector (weighted heuristic — بهتر و پایدارتر) --------
 def looks_like_ecg(img: Image.Image) -> bool:
     gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
     h, w = gray.shape
 
-    # ECG معمولاً افقی‌تر است
-    if w < h * 1.25:
-        return False
+    score = 0.0
 
-    # کنتراست (ECG متوسط است، نه خیلی کم)
-    if gray.std() < 0.07:
-        return False
+    # افقی بودن تصویر (ECG معمولاً افقی‌تر است)
+    if w > h * 1.15:
+        score += 0.4
 
-    # گرادیان ساده (لبه‌ها)
+    # کنتراست (نه خیلی صاف، نه خیلی پرنویز)
+    score += min(gray.std() * 2, 0.4)
+
+    # لبه‌ها (وجود موج‌ها و خطوط شبکه)
     gx = gray[:, 1:] - gray[:, :-1]
     gy = gray[1:, :] - gray[:-1, :]
     edges = np.abs(gx).mean() + np.abs(gy).mean()
+    score += min(edges * 2, 0.4)
 
-    # اگر خیلی صاف باشد → ECG نیست
-    if edges < 0.07:
-        return False
-
-    # بررسی خطوط افقی (شبکه و موج)
+    # تغییرپذیری افقی (وجود لید/موج تکراری)
     row_var = gray.var(axis=1).mean()
-    if row_var < 0.005:
-        return False
+    score += min(row_var * 20, 0.4)
 
-    return True
+    # تصمیم نهایی — اگر مجموع ویژگی‌ها به اندازه کافی شبیه بود
+    return score >= 0.6
 
 
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Uploaded Image", width=350)
 
-    # 1) ECG detector
+    # مرحله ۱: تشخیص ECG
     if not looks_like_ecg(img):
         st.error("❌ این تصویر شبیه نوار قلب نیست.")
     else:
-        # 2) EF prediction
+        # مرحله ۲: پیش‌بینی EF
         x = preprocess(img)
 
         with torch.no_grad():
