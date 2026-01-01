@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 from PIL import Image
 import numpy as np
-import cv2
 
 
 # -------- MODEL ----------
@@ -58,31 +57,33 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
-# ----- quick ECG detector (rule-based) -----
+# ---- quick ECG detector (NO cv2) ----
 def looks_like_ecg(img: Image.Image) -> bool:
-    arr = np.array(img.convert("L"))
-    h, w = arr.shape
+    gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
+    h, w = gray.shape
 
-    # ECG is usually wider than tall
+    # ECG معمولاً افقی‌تر است
     if w < h * 1.2:
         return False
 
-    # detect amount of edges (ECG has many fine edges)
-    edges = cv2.Canny(arr, 40, 120)
-    edge_ratio = edges.mean()
+    # یک فیلتر لبه ساده (Sobel دستی)
+    gx = gray[:, 1:] - gray[:, :-1]
+    gy = gray[1:, :] - gray[:-1, :]
+    edges = np.abs(gx).mean() + np.abs(gy).mean()
 
-    return edge_ratio > 0.03
+    # اگر لبه‌ها خیلی کم باشند -> احتمالاً ECG نیست
+    return edges > 0.08
 
 
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Uploaded Image", width=350)
 
-    # -------- 1) check if ECG ----------
+    # 1) تشخیص نوار قلب
     if not looks_like_ecg(img):
         st.error("❌ این تصویر شبیه نوار قلب نیست.")
     else:
-        # -------- 2) EF prediction ----------
+        # 2) پیش‌بینی EF
         x = preprocess(img)
 
         with torch.no_grad():
