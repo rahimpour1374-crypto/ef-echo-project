@@ -4,7 +4,8 @@ import torch.nn as nn
 from PIL import Image
 import numpy as np
 
-# ---------------- MODEL ARCHITECTURE ----------------
+
+# --------- MODEL ARCHITECTURE ----------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -26,6 +27,7 @@ class SimpleEF(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 @st.cache_resource
 def load_model():
     model = SimpleEF()
@@ -34,12 +36,12 @@ def load_model():
     model.eval()
     return model
 
+
 model = load_model()
 
-# ---------------- UI ----------------
 st.title("EF Classifier (ECG → EF Group)")
 
-uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
+uploaded = st.file_uploader("Upload ECG image", type=["jpg", "jpeg", "png"])
 
 labels = {
     0: "EF < 35%",
@@ -47,11 +49,13 @@ labels = {
     2: "EF ≥ 50%"
 }
 
+
 def preprocess(img):
     img = img.convert("RGB").resize((224, 224))
     arr = np.array(img).astype("float32") / 255.0
     arr = np.transpose(arr, (2, 0, 1))
     return torch.tensor(arr).unsqueeze(0)
+
 
 if uploaded:
     img = Image.open(uploaded)
@@ -61,6 +65,17 @@ if uploaded:
 
     with torch.no_grad():
         y = model(x)
-        pred = int(torch.argmax(y, dim=1)[0])
 
-    st.success(f"EF group: {labels[pred]}")
+        # probabilities
+        probs = torch.softmax(y, dim=1)[0]
+        conf, pred = torch.max(probs, dim=0)
+        conf = float(conf)
+
+    # -------- detect NON-ECG images --------
+    if conf < 0.45:
+        st.error("❌ این تصویر نوار قلب نیست یا کیفیتش مناسب نیست.")
+        st.caption(f"(confidence = {conf:.2f})")
+    else:
+        st.subheader("Result:")
+        st.success(f"{labels[int(pred)]}")
+        st.caption(f"confidence = {conf:.2f}")
