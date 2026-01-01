@@ -1,4 +1,4 @@
-# VERSION: ECG-DETECT-STRICT
+# VERSION: ECG-BALANCED
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -58,17 +58,17 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
-# ---- stricter ECG detector (NO cv2) ----
+# ---- ECG detector (balanced — نه خیلی سفت، نه خیلی شُل) ----
 def looks_like_ecg(img: Image.Image) -> bool:
     gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
     h, w = gray.shape
 
-    # باید واضحاً افقی‌تر باشد
-    if w < h * 1.6:
+    # ECG معمولاً افقی‌تر است
+    if w < h * 1.25:
         return False
 
-    # کنتراست — ECG معمولاً کنتراست متوسط دارد
-    if gray.std() < 0.12:
+    # کنتراست (ECG متوسط است، نه خیلی کم)
+    if gray.std() < 0.07:
         return False
 
     # گرادیان ساده (لبه‌ها)
@@ -76,8 +76,16 @@ def looks_like_ecg(img: Image.Image) -> bool:
     gy = gray[1:, :] - gray[:-1, :]
     edges = np.abs(gx).mean() + np.abs(gy).mean()
 
-    # ECG معمولا edge pattern بیشتری دارد
-    return edges > 0.12
+    # اگر خیلی صاف باشد → ECG نیست
+    if edges < 0.07:
+        return False
+
+    # بررسی خطوط افقی (شبکه و موج)
+    row_var = gray.var(axis=1).mean()
+    if row_var < 0.005:
+        return False
+
+    return True
 
 
 if uploaded:
