@@ -1,4 +1,4 @@
-# VERSION: no-cv2
+# VERSION: ECG-DETECT-STRICT
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -58,33 +58,37 @@ def preprocess(img):
     return torch.tensor(arr).unsqueeze(0)
 
 
-# ---- quick ECG detector (NO cv2) ----
+# ---- stricter ECG detector (NO cv2) ----
 def looks_like_ecg(img: Image.Image) -> bool:
     gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
     h, w = gray.shape
 
-    # ECG معمولاً افقی‌تر است
-    if w < h * 1.2:
+    # باید واضحاً افقی‌تر باشد
+    if w < h * 1.6:
         return False
 
-    # یک فیلتر لبه ساده (Sobel دستی)
+    # کنتراست — ECG معمولاً کنتراست متوسط دارد
+    if gray.std() < 0.12:
+        return False
+
+    # گرادیان ساده (لبه‌ها)
     gx = gray[:, 1:] - gray[:, :-1]
     gy = gray[1:, :] - gray[:-1, :]
     edges = np.abs(gx).mean() + np.abs(gy).mean()
 
-    # اگر لبه‌ها خیلی کم باشند -> احتمالاً ECG نیست
-    return edges > 0.08
+    # ECG معمولا edge pattern بیشتری دارد
+    return edges > 0.12
 
 
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Uploaded Image", width=350)
 
-    # 1) تشخیص نوار قلب
+    # 1) ECG detector
     if not looks_like_ecg(img):
         st.error("❌ این تصویر شبیه نوار قلب نیست.")
     else:
-        # 2) پیش‌بینی EF
+        # 2) EF prediction
         x = preprocess(img)
 
         with torch.no_grad():
