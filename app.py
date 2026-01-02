@@ -1,5 +1,3 @@
-# --- EF ECG App (with rule biasing + explanations) ---
-
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -7,7 +5,7 @@ from PIL import Image
 import numpy as np
 
 
-# ------------------- MODEL -------------------
+# ------------ MODEL ------------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -41,9 +39,54 @@ def load_model():
 
 model = load_model()
 
-st.title("EF Classifier (ECG → EF Group)")
 
-uploaded = st.file_uploader("Upload ECG image", type=["jpg", "jpeg", "png"])
+# ------------ detect ECG background (pink grid) ------------
+def has_ecg_pink_background(img: Image.Image) -> bool:
+    arr = np.array(img.resize((300, 200))).astype(np.float32) / 255.0
+
+    # رنگ صورتی کاغذ ECG → (R زیاد، G متوسط، B کم)
+    r = arr[..., 0].mean()
+    g = arr[..., 1].mean()
+    b = arr[..., 2].mean()
+
+    # محدوده منطقی برای grid ECG
+    return (r > 0.75) and (g > 0.55) and (b < 0.55)
+
+
+# ------------ STRONG ECG DETECTOR ------------
+def looks_like_ecg(img: Image.Image) -> bool:
+
+    # 1️⃣ اگر بک‌گراند صورتی باشد → ECG است
+    if has_ecg_pink_background(img):
+        return True
+
+    # 2️⃣ بقیه ویژگی‌ها (برای سایر ECG ها)
+    g = np.array(img.convert("L"), dtype=np.float32) / 255.0
+    h, w = g.shape
+
+    wide = w >= h * 1.1
+
+    gx = np.abs(g[:, 1:] - g[:, :-1]).mean()
+    gy = np.abs(g[1:, :] - g[:-1, :]).mean()
+    grid = (gx + gy) / 2 > 0.05
+
+    row_var = g.var(axis=1)
+    multi_leads = (row_var > 0.01).sum() > h * 0.25
+
+    col_var = g.var(axis=0).mean()
+    waves = col_var > 0.008
+
+    score = sum([wide, grid, multi_leads, waves])
+
+    return score >= 3
+
+
+# ------------ PREPROCESS ------------
+def preprocess(img):
+    arr = np.array(img.convert("RGB").resize((224, 224))).astype("float32") / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    return torch.tensor(arr).unsqueeze(0)
+
 
 labels = {
     0: "EF < 35%",
@@ -51,88 +94,63 @@ labels = {
     2: "EF ≥ 50%"
 }
 
+st.title("EF Classifier (ECG → EF Group)")
 
-# ---------------- PREPROCESS ----------------
-def preprocess(img):
-    img = img.convert("RGB").resize((224, 224))
-    arr = np.array(img).astype("float32") / 255.0
-    arr = np.transpose(arr, (2, 0, 1))
-    return torch.tensor(arr).unsqueeze(0)
-
-
-# ------------ simple ECG detector -----------
-def looks_like_ecg(img: Image.Image) -> bool:
-    gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
-    h, w = gray.shape
-
-    # must look wide like ECG paper
-    if w < h * 1.2:
-        return False
-
-    gx = gray[:, 1:] - gray[:, :-1]
-    gy = gray[1:, :] - gray[:-1, :]
-    edges = np.abs(gx).mean() + np.abs(gy).mean()
-
-    return edges > 0.06
-
-
-# ---------- cardiomyopathy pattern rules ----------
-def ecg_features(img: Image.Image):
-    gray = np.array(img.convert("L"), dtype=np.float32)
-    h, w = gray.shape
-    mid = gray[h // 2]
-
-    features = []
-
-    # 1) wide QRS proxy
-    transitions = np.mean(np.abs(np.diff(mid)))
-    if transitions > 18:
-        features.append("Possible wide QRS")
-
-    # 2) negative onset (pseudo low EF)
-    if np.mean(mid[:40]) > np.mean(mid[60:100]):
-        features.append("Initial negative deflection")
-
-    # 3) poor R progression proxy
-    if np.std(gray[:, w // 3:2 * w // 3]) < 12:
-        features.append("Poor R progression")
-
-    return features
-
+uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
 if uploaded:
-    img = Image.open(uploaded)
-    st.image(img, caption="Uploaded image", width=360)
 
-    # --------- ECG check ----------
+    img = Image.open(uploaded)
+    st.image(img, caption="Uploaded image", width=350)
+
+    # -------- ECG CHECK --------
     if not looks_like_ecg(img):
         st.error(
-            "❌ This image does not appear to be an ECG recording. "
-            "The system looks for ECG grid paper, multiple parallel leads, "
-            "and characteristic waveform morphology."
+            "❌ This image does not appear to be an ECG recording.\n\n"
+            "The system looks for:\n"
+            "• ECG grid paper (often pink)\n"
+            "• Multiple parallel leads\n"
+            "• Repeating waveform morphology"
         )
-    else:
-        # run CNN
-        x = preprocess(img)
-        with torch.no_grad():
-            y = model(x)
-            probs = torch.softmax(y, dim=1)[0]
-            conf, pred = torch.max(probs, dim=0)
+        st.stop()
 
-        # interpret features
-        features_found = ecg_features(img)
+    # -------- PREDICT EF --------
+    x = preprocess(img)
 
-        # ------------ bias rule --------------
-        # If no cardiomyopathy-like signs → lean toward 35–49%
-        if len(features_found) == 0:
-            pred = torch.tensor(1)
+    with torch.no_grad():
+        y = model(x)
+        probs = torch.softmax(y, dim=1)[0]
+        conf, pred = torch.max(probs, dim=0)
 
-        # final output
-        st.subheader("EF estimate")
-        st.success(labels[int(pred)])
-        st.caption(f"Confidence: {float(conf):.2f}")
+    # bias toward 35–49 when uncertain
+    if conf < 0.45:
+        pred = torch.tensor(1)
 
-        # explanation
-        st.markdown("### ECG interpretation (AI-assisted)")
-        st.write(", ".join(features_found) if features_found else
-                 "No major cardiomyopathy patterns detected.")
+    st.subheader("EF estimate")
+    st.success(labels[int(pred)])
+    st.caption(f"Confidence: {float(conf):.2f}")
+
+    # -------- INTERPRETATION --------
+    st.subheader("ECG interpretation (AI-assisted)")
+
+    explanation = []
+
+    if conf < 0.45:
+        explanation.append(
+            "Pattern is nonspecific — classification biased toward EF 35–49%."
+        )
+
+    if pred == 0:
+        explanation.append(
+            "Possible cardiomyopathy pattern (wide QRS / initial negative deflection / abnormal morphology)."
+        )
+
+    if pred == 2:
+        explanation.append(
+            "No major cardiomyopathy markers — waveform morphology appears preserved."
+        )
+
+    if not explanation:
+        explanation.append("No major cardiomyopathy patterns detected.")
+
+    st.write("• " + "\n• ".join(explanation))
