@@ -4,6 +4,8 @@ import torch.nn as nn
 from PIL import Image
 import numpy as np
 
+
+# ---------------- MODEL ----------------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -19,7 +21,7 @@ class SimpleEF(nn.Module):
             nn.Flatten(),
             nn.Linear(32 * 56 * 56, 64),
             nn.ReLU(),
-            nn.Linear(64, 3)     # model still predicts 3 classes internally
+            nn.Linear(64, 2)      # ← دو کلاس فقط
         )
 
     def forward(self, x):
@@ -34,62 +36,81 @@ def load_model():
     model.eval()
     return model
 
+
 model = load_model()
+
 
 st.title("EF Classifier (ECG → EF Group)")
 
-uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
-# ---- helpers ----
+# ------------- ECG DETECTOR -------------
+def is_probable_ecg(img: Image.Image) -> bool:
+    arr = np.array(img.convert("RGB"))
+
+    h, w, _ = arr.shape
+    if w < h * 1.1:          # بیشتر افقی باشد
+        return False
+
+    # تشخیص «پس‌زمینه صورتی ECG»
+    mean_color = arr.mean(axis=(0,1))
+    if mean_color[0] > 190 and mean_color[1] > 150 and mean_color[2] > 160:
+        return True
+
+    # شطرنجی (grid)
+    gx = np.abs(arr[:,1:] - arr[:,:-1]).mean()
+    gy = np.abs(arr[1:,:] - arr[:-1,:]).mean()
+
+    # اگر خطوط افقی/عمودی زیاد باشد → شبیه نوار
+    return (gx + gy) > 18
+
+
+
+# ------------- EF PREPROCESS -------------
 def preprocess(img):
     img = img.convert("RGB").resize((224, 224))
-    arr = np.array(img).astype("float32") / 255.0
-    arr = np.transpose(arr, (2, 0, 1))
-    return torch.tensor(arr).unsqueeze(0)
+    x = np.array(img).astype("float32") / 255.0
+    x = np.transpose(x, (2,0,1))
+    return torch.tensor(x).unsqueeze(0)
 
 
-def has_pink_grid(img):
-    arr = np.array(img.convert("RGB"))/255.0
-    r,g,b = arr[:,:,0],arr[:,:,1],arr[:,:,2]
-    pink = (r>0.75)&(g<0.65)&(b<0.75)
-    return pink.mean()>0.10
 
+# ------------- CARDIOMYOPATHY RULES -------------
+def cardiomyopathy_hints(img):
+    txt = []
 
-def looks_like_ecg_structure(img):
     gray = np.array(img.convert("L"))/255.0
-    gx = np.abs(gray[:,1:]-gray[:,:-1]).mean()
-    gy = np.abs(gray[1:,:]-gray[:-1,:]).mean()
-    return (gx+gy) > 0.10
+    edges = np.abs(gray[:,1:] - gray[:,:-1]).mean()
+
+    # QRS پهن (خیلی ساده)
+    if edges > 0.22:
+        txt.append("Possible wide QRS")
+
+    # شروع منفی
+    if gray.mean() < 0.35:
+        txt.append("Initial negative deflection")
+
+    return txt
 
 
-def cardiomyopathy_rules(gray):
-    h,w = gray.shape
-    mid = gray[:, w//3:2*w//3]
-    gx = np.abs(mid[:,1:] - mid[:,:-1])
-    qrs_width = (gx>0.25).sum(axis=1).mean()
 
-    findings=[]
-    if qrs_width>35: findings.append("Wide QRS")
-    if gray.mean()<0.40: findings.append("Initial negative deflection")
-    if np.var(gray)<0.01: findings.append("Poor R progression")
-    return findings
+# ------------- UI -------------
+uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
+labels = {
+    0: "EF ≤ 35%",
+    1: "EF > 35%"
+}
 
-# ---------- main ----------
 if uploaded:
     img = Image.open(uploaded)
     st.image(img, caption="Uploaded image", width=380)
 
-    gray = np.array(img.convert("L"))/255.0
-
-    ecg_conf = 0
-    if has_pink_grid(img): ecg_conf += 2
-    if looks_like_ecg_structure(img): ecg_conf += 1
-
-    if ecg_conf == 0:
+    # ECG check
+    if not is_probable_ecg(img):
         st.error(
-            "❌ This image does not appear to be an ECG recording.\n"
-            "The system looks for typical ECG paper (often pink), multiple parallel leads, and waveform morphology."
+            "❌ This image does not appear to be an ECG recording.\n\n"
+            "The system looks for: grid paper (often pink), multiple aligned leads, "
+            "and repetitive ECG wave morphology."
         )
 
     else:
@@ -97,27 +118,20 @@ if uploaded:
 
         with torch.no_grad():
             y = model(x)
-            probs = torch.softmax(y, dim=1)[0]
-            conf, pred = torch.max(probs, dim=0)
-
-        notes = cardiomyopathy_rules(gray)
-
-        # convert 3-class → 2-class
-        # class 0 (old)  → EF ≤ 35
-        # class 1/2      → EF > 35
-        final_group = "EF ≤ 35%" if int(pred)==0 else "EF > 35%"
-
-        # if no worrying ECG features → bias to EF>35
-        if len(notes)==0:
-            final_group = "EF > 35%"
+            prob = torch.softmax(y, dim=1)[0]
+            pred = int(prob.argmax())
 
         st.subheader("EF estimate")
-        st.success(final_group)
-        st.caption(f"Confidence (raw model): {float(conf):.2f}")
+        st.success(labels[pred])
+
+        st.caption(f"Confidence: {float(prob[pred]):.2f}")
+
+        # AI-assisted explanation
+        hints = cardiomyopathy_hints(img)
 
         st.subheader("ECG interpretation (AI-assisted)")
-        if notes:
-            for n in notes:
-                st.write(f"• {n}")
+        if hints:
+            for h in hints:
+                st.write("• " + h)
         else:
             st.write("• No major cardiomyopathy pattern detected.")
