@@ -4,8 +4,6 @@ import torch.nn as nn
 from PIL import Image
 import numpy as np
 
-
-# ------------ MODEL ------------
 class SimpleEF(nn.Module):
     def __init__(self):
         super().__init__()
@@ -21,7 +19,7 @@ class SimpleEF(nn.Module):
             nn.Flatten(),
             nn.Linear(32 * 56 * 56, 64),
             nn.ReLU(),
-            nn.Linear(64, 3)
+            nn.Linear(64, 3)     # model still predicts 3 classes internally
         )
 
     def forward(self, x):
@@ -36,121 +34,90 @@ def load_model():
     model.eval()
     return model
 
-
 model = load_model()
-
-
-# ------------ detect ECG background (pink grid) ------------
-def has_ecg_pink_background(img: Image.Image) -> bool:
-    arr = np.array(img.resize((300, 200))).astype(np.float32) / 255.0
-
-    # رنگ صورتی کاغذ ECG → (R زیاد، G متوسط، B کم)
-    r = arr[..., 0].mean()
-    g = arr[..., 1].mean()
-    b = arr[..., 2].mean()
-
-    # محدوده منطقی برای grid ECG
-    return (r > 0.75) and (g > 0.55) and (b < 0.55)
-
-
-# ------------ STRONG ECG DETECTOR ------------
-def looks_like_ecg(img: Image.Image) -> bool:
-
-    # 1️⃣ اگر بک‌گراند صورتی باشد → ECG است
-    if has_ecg_pink_background(img):
-        return True
-
-    # 2️⃣ بقیه ویژگی‌ها (برای سایر ECG ها)
-    g = np.array(img.convert("L"), dtype=np.float32) / 255.0
-    h, w = g.shape
-
-    wide = w >= h * 1.1
-
-    gx = np.abs(g[:, 1:] - g[:, :-1]).mean()
-    gy = np.abs(g[1:, :] - g[:-1, :]).mean()
-    grid = (gx + gy) / 2 > 0.05
-
-    row_var = g.var(axis=1)
-    multi_leads = (row_var > 0.01).sum() > h * 0.25
-
-    col_var = g.var(axis=0).mean()
-    waves = col_var > 0.008
-
-    score = sum([wide, grid, multi_leads, waves])
-
-    return score >= 3
-
-
-# ------------ PREPROCESS ------------
-def preprocess(img):
-    arr = np.array(img.convert("RGB").resize((224, 224))).astype("float32") / 255.0
-    arr = np.transpose(arr, (2, 0, 1))
-    return torch.tensor(arr).unsqueeze(0)
-
-
-labels = {
-    0: "EF < 35%",
-    1: "EF 35–49%",
-    2: "EF ≥ 50%"
-}
 
 st.title("EF Classifier (ECG → EF Group)")
 
 uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
+# ---- helpers ----
+def preprocess(img):
+    img = img.convert("RGB").resize((224, 224))
+    arr = np.array(img).astype("float32") / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    return torch.tensor(arr).unsqueeze(0)
+
+
+def has_pink_grid(img):
+    arr = np.array(img.convert("RGB"))/255.0
+    r,g,b = arr[:,:,0],arr[:,:,1],arr[:,:,2]
+    pink = (r>0.75)&(g<0.65)&(b<0.75)
+    return pink.mean()>0.10
+
+
+def looks_like_ecg_structure(img):
+    gray = np.array(img.convert("L"))/255.0
+    gx = np.abs(gray[:,1:]-gray[:,:-1]).mean()
+    gy = np.abs(gray[1:,:]-gray[:-1,:]).mean()
+    return (gx+gy) > 0.10
+
+
+def cardiomyopathy_rules(gray):
+    h,w = gray.shape
+    mid = gray[:, w//3:2*w//3]
+    gx = np.abs(mid[:,1:] - mid[:,:-1])
+    qrs_width = (gx>0.25).sum(axis=1).mean()
+
+    findings=[]
+    if qrs_width>35: findings.append("Wide QRS")
+    if gray.mean()<0.40: findings.append("Initial negative deflection")
+    if np.var(gray)<0.01: findings.append("Poor R progression")
+    return findings
+
+
+# ---------- main ----------
 if uploaded:
-
     img = Image.open(uploaded)
-    st.image(img, caption="Uploaded image", width=350)
+    st.image(img, caption="Uploaded image", width=380)
 
-    # -------- ECG CHECK --------
-    if not looks_like_ecg(img):
+    gray = np.array(img.convert("L"))/255.0
+
+    ecg_conf = 0
+    if has_pink_grid(img): ecg_conf += 2
+    if looks_like_ecg_structure(img): ecg_conf += 1
+
+    if ecg_conf == 0:
         st.error(
-            "❌ This image does not appear to be an ECG recording.\n\n"
-            "The system looks for:\n"
-            "• ECG grid paper (often pink)\n"
-            "• Multiple parallel leads\n"
-            "• Repeating waveform morphology"
-        )
-        st.stop()
-
-    # -------- PREDICT EF --------
-    x = preprocess(img)
-
-    with torch.no_grad():
-        y = model(x)
-        probs = torch.softmax(y, dim=1)[0]
-        conf, pred = torch.max(probs, dim=0)
-
-    # bias toward 35–49 when uncertain
-    if conf < 0.45:
-        pred = torch.tensor(1)
-
-    st.subheader("EF estimate")
-    st.success(labels[int(pred)])
-    st.caption(f"Confidence: {float(conf):.2f}")
-
-    # -------- INTERPRETATION --------
-    st.subheader("ECG interpretation (AI-assisted)")
-
-    explanation = []
-
-    if conf < 0.45:
-        explanation.append(
-            "Pattern is nonspecific — classification biased toward EF 35–49%."
+            "❌ This image does not appear to be an ECG recording.\n"
+            "The system looks for typical ECG paper (often pink), multiple parallel leads, and waveform morphology."
         )
 
-    if pred == 0:
-        explanation.append(
-            "Possible cardiomyopathy pattern (wide QRS / initial negative deflection / abnormal morphology)."
-        )
+    else:
+        x = preprocess(img)
 
-    if pred == 2:
-        explanation.append(
-            "No major cardiomyopathy markers — waveform morphology appears preserved."
-        )
+        with torch.no_grad():
+            y = model(x)
+            probs = torch.softmax(y, dim=1)[0]
+            conf, pred = torch.max(probs, dim=0)
 
-    if not explanation:
-        explanation.append("No major cardiomyopathy patterns detected.")
+        notes = cardiomyopathy_rules(gray)
 
-    st.write("• " + "\n• ".join(explanation))
+        # convert 3-class → 2-class
+        # class 0 (old)  → EF ≤ 35
+        # class 1/2      → EF > 35
+        final_group = "EF ≤ 35%" if int(pred)==0 else "EF > 35%"
+
+        # if no worrying ECG features → bias to EF>35
+        if len(notes)==0:
+            final_group = "EF > 35%"
+
+        st.subheader("EF estimate")
+        st.success(final_group)
+        st.caption(f"Confidence (raw model): {float(conf):.2f}")
+
+        st.subheader("ECG interpretation (AI-assisted)")
+        if notes:
+            for n in notes:
+                st.write(f"• {n}")
+        else:
+            st.write("• No major cardiomyopathy pattern detected.")
