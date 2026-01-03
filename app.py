@@ -1,137 +1,147 @@
-import streamlit as st
-import torch
-import torch.nn as nn
-from PIL import Image
+import cv2
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 
-# ---------------- MODEL ----------------
-class SimpleEF(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
+# ---------------------------
+# 1) ابزار عمومی پردازش تصویر
+# ---------------------------
 
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Flatten(),
-            nn.Linear(32 * 56 * 56, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2)      # ← دو کلاس فقط
-        )
-
-    def forward(self, x):
-        return self.net(x)
+def load_gray(path):
+    img = cv2.imread(path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    return gray
 
 
-@st.cache_resource
-def load_model():
-    model = SimpleEF()
-    state = torch.load("ef_model.pt", map_location="cpu")
-    model.load_state_dict(state, strict=False)
-    model.eval()
-    return model
+def extract_trace(gray):
+    # ساده: خط موج را به عنوان مینیمم پیکسل‌ها می‌گیریم
+    # برای ECGهای تمیز surprisingly خوب کار می‌کند
+    signal = 255 - gray.mean(axis=0)
+    signal = (signal - signal.min()) / (signal.max() - signal.min() + 1e-6)
+    return signal
 
 
-model = load_model()
+# ---------------------------
+# 2) تشخیص baseline + QRS
+# ---------------------------
+
+def estimate_baseline(signal):
+    win = 40
+    smooth = np.convolve(signal, np.ones(win)/win, mode="same")
+    return np.median(smooth)
 
 
-st.title("EF Classifier (ECG → EF Group)")
+def detect_qrs(signal, baseline):
+    diff = np.gradient(signal)
+    R = int(np.argmax(signal))
+
+    # Q
+    Q = R
+    while Q > 1 and signal[Q] > baseline:
+        Q -= 1
+
+    # S
+    S = R
+    while S < len(signal)-1 and signal[S] > baseline:
+        S += 1
+
+    q_ms = (S - Q) * 40/1000.0   # assuming 25 mm/s grid
+
+    return Q, R, S, q_ms
 
 
-# ------------- ECG DETECTOR -------------
-def is_probable_ecg(img: Image.Image) -> bool:
-    arr = np.array(img.convert("RGB"))
+# ---------------------------
+# 3) features لیدهای V1–V6
+# ---------------------------
 
-    h, w, _ = arr.shape
-    if w < h * 1.1:          # بیشتر افقی باشد
-        return False
-
-    # تشخیص «پس‌زمینه صورتی ECG»
-    mean_color = arr.mean(axis=(0,1))
-    if mean_color[0] > 190 and mean_color[1] > 150 and mean_color[2] > 160:
-        return True
-
-    # شطرنجی (grid)
-    gx = np.abs(arr[:,1:] - arr[:,:-1]).mean()
-    gy = np.abs(arr[1:,:] - arr[:-1,:]).mean()
-
-    # اگر خطوط افقی/عمودی زیاد باشد → شبیه نوار
-    return (gx + gy) > 18
+def measure_R(signal, baseline):
+    R = np.max(signal - baseline)
+    return float(R)
 
 
-
-# ------------- EF PREPROCESS -------------
-def preprocess(img):
-    img = img.convert("RGB").resize((224, 224))
-    x = np.array(img).astype("float32") / 255.0
-    x = np.transpose(x, (2,0,1))
-    return torch.tensor(x).unsqueeze(0)
-
+def rule_prwp(R):
+    # R: dict(V1..V6)
+    if R["V3"] < 3:
+        return 1
+    trend = np.diff([R[k] for k in ["V1","V2","V3","V4"]])
+    return int(np.mean(trend) < 1.0)
 
 
-# ------------- CARDIOMYOPATHY RULES -------------
-def cardiomyopathy_hints(img):
-    txt = []
-
-    gray = np.array(img.convert("L"))/255.0
-    edges = np.abs(gray[:,1:] - gray[:,:-1]).mean()
-
-    # QRS پهن (خیلی ساده)
-    if edges > 0.22:
-        txt.append("Possible wide QRS")
-
-    # شروع منفی
-    if gray.mean() < 0.35:
-        txt.append("Initial negative deflection")
-
-    return txt
+def rule_qrs_wide(qrs_ms):
+    return int(qrs_ms >= 120)
 
 
+def rule_low_voltage(R):
+    avg = np.mean(list(R.values()))
+    return int(avg < 5)
 
-# ------------- UI -------------
-uploaded = st.file_uploader("Upload ECG image", type=["jpg","jpeg","png"])
 
-labels = {
-    0: "EF ≤ 35%",
-    1: "EF > 35%"
-}
+def rule_pathologic_Q(Q_ms, Q_mm, R_mm):
+    return int(Q_ms >= 40 or (R_mm and Q_mm/R_mm >= 0.25))
 
-if uploaded:
-    img = Image.open(uploaded)
-    st.image(img, caption="Uploaded image", width=380)
 
-    # ECG check
-    if not is_probable_ecg(img):
-        st.error(
-            "❌ This image does not appear to be an ECG recording.\n\n"
-            "The system looks for: grid paper (often pink), multiple aligned leads, "
-            "and repetitive ECG wave morphology."
-        )
+# ---------------------------
+# 4) سیستم هیبرید EF
+# ---------------------------
 
-    else:
-        x = preprocess(img)
+def combine(model_prob, rules):
+    # rules score between -2 to +2
+    score = 0
+    if rules.get("prwp"): score += 1
+    if rules.get("wide"): score += 1
+    if rules.get("lowvolt"): score += 1
+    if rules.get("qpath"): score += 1
 
-        with torch.no_grad():
-            y = model(x)
-            prob = torch.softmax(y, dim=1)[0]
-            pred = int(prob.argmax())
+    p = model_prob
 
-        st.subheader("EF estimate")
-        st.success(labels[pred])
+    # confidence blending (linear)
+    hybrid = np.clip(p + 0.08 * score, 0, 1)
+    return hybrid
 
-        st.caption(f"Confidence: {float(prob[pred]):.2f}")
 
-        # AI-assisted explanation
-        hints = cardiomyopathy_hints(img)
+# ---------------------------
+# 5) wrapper اصلی
+# ---------------------------
 
-        st.subheader("ECG interpretation (AI-assisted)")
-        if hints:
-            for h in hints:
-                st.write("• " + h)
-        else:
-            st.write("• No major cardiomyopathy pattern detected.")
+def analyze_ecg_image(path, model, device="cpu"):
+
+    gray = load_gray(path)
+    signal = extract_trace(gray)
+    baseline = estimate_baseline(signal)
+
+    Q,R,S,qrs_ms = detect_qrs(signal, baseline)
+
+    R_amp = measure_R(signal, baseline)
+
+    # فقط دموی لیدها
+    leads = {"V1":R_amp, "V2":R_amp*1.2, "V3":R_amp*1.3,
+             "V4":R_amp*1.5, "V5":R_amp*1.4, "V6":R_amp*1.2}
+
+    rules = dict(
+        prwp = rule_prwp(leads),
+        wide = rule_qrs_wide(qrs_ms*1000),
+        lowvolt = rule_low_voltage(leads),
+        qpath = 0
+    )
+
+    # مدل CNN
+    img = cv2.imread(path)
+    img = cv2.resize(img, (224,224))
+    x = torch.tensor(img.transpose(2,0,1)).float()/255.
+    x = x.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(x)
+        prob = F.softmax(out, dim=1)[0,0].item()  # EF<35 prob
+
+    hybrid = combine(prob, rules)
+
+    return {
+        "model_prob": prob,
+        "hybrid_prob": hybrid,
+        "rules": rules,
+        "qrs_ms": qrs_ms*1000,
+        "R_amp": R_amp
+    }
